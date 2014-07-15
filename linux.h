@@ -52,6 +52,9 @@ enum {
 	RESP_SET_LONG_ADDRESS	= 0x91, /* u8 id, u8 status */
 };
 
-#define PRINT_START_BYTES() hif_putc('z'); hif_putc('b');
+static inline void WAIT_MS(uint16_t t)
+{
+    while (t--) DELAY_MS(1);
+}
 
 #endif

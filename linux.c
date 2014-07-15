@@ -29,22 +29,23 @@
 /* Firmware to use with the serial 802.15.4 driver for linux */
 
 #include "board.h"
+#include "radio.h"
 #include "transceiver.h"
 #include "ioutil.h"
 #include "hif.h"
 #include <avr/eeprom.h>
 #include "linux.h"
 
-#define TRX_IDLE 0
-#define TRX_TX   1
-#define TRX_RX   2
-#define TRX_CMD  3
+#define SERIAL_HEADER 4
+#define RX_BUF_CNT 2
 
-static uint8_t rxfrm[MAX_FRAME_SIZE];
-static uint8_t buf[0xFF];
-static uint8_t rx_buf[0x102];
-static uint8_t rx_len;
-static uint8_t state;
+static uint8_t buf[MAX_FRAME_SIZE + SERIAL_HEADER]; // general purpose buffer
+uint8_t rx_buf[SERIAL_HEADER + MAX_FRAME_SIZE]; // for data receiving interrupt
+uint8_t rx_read_buf[RX_BUF_CNT][sizeof(buffer_t) + MAX_FRAME_SIZE]; // data for pbuf
+buffer_t *pbuf[RX_BUF_CNT]; //received frames
+
+volatile uint8_t rx_block;
+volatile bool tx_pending;
 
 static int getc_wait(void)
 {
@@ -58,8 +59,7 @@ static int getc_wait(void)
 
 int main(void)
 {
-	trx_regval_t rval;
-	int i;
+	int i, j, k, buf_n = 0;
 
 	/* This will stop the application before initializing the radio
 	 * transceiver (ISP issue with MISO pin, see FAQ)
@@ -67,68 +67,51 @@ int main(void)
 	trap_if_key_pressed();
 
 	/* Step 0: init MCU peripherals */
+	KEY_INIT();
 	hif_init(HIF_DEFAULT_BAUDRATE);
 
 	LED_INIT();
-	trx_io_init(SPI_RATE_1_2);
 	LED_SET_VALUE(0);
+	TIMER_INIT();
 
-	/* Step 1: initialize the transceiver */
-	TRX_RESET_LOW();
-	TRX_SLPTR_LOW();
-	DELAY_US(TRX_RESET_TIME_US);
-	TRX_RESET_HIGH();
-	trx_reg_write(RG_TRX_STATE, CMD_TRX_OFF);
-	DELAY_US(TRX_INIT_TIME_US);
-	rval = trx_bit_read(SR_TRX_STATUS);
 
-	/* Step 2: setup transmitter
-	 * - configure radio channel
-	 * - go into RX state,
-	 * - enable "receive end" IRQ
-	 */
-	trx_bit_write(SR_CHANNEL, 1);
-	trx_bit_write(SR_TX_AUTO_CRC_ON, 1);
-	trx_reg_write(RG_TRX_STATE, CMD_RX_AACK_ON);
-#if defined(TRX_IRQ_TRX_END)
-	trx_reg_write(RG_IRQ_MASK, TRX_IRQ_TRX_END);
-#elif defined(TRX_IRQ_RX_END) && defined(TRX_IRQ_TX_END)
-	trx_reg_write(RG_IRQ_MASK, TRX_IRQ_RX_END | TRX_IRQ_TX_END |
-		      TRX_IRQ_RX_START);
-#else
-#  error "Unknown IRQ bits"
-#endif
+	for (i = 0; i < RX_BUF_CNT; i++)
+		/* Initialize buffer structure */
+		pbuf[i] = buffer_init(rx_read_buf[i], sizeof(rx_read_buf[i]), 0);
+
+
+	radio_init(rx_buf, MAX_FRAME_SIZE);
+
+	radio_set_param(RP_IDLESTATE(STATE_RXAUTO));
+	radio_set_param(RP_CHANNEL(17));
+	radio_set_param(RP_SHORTADDR(0x1234));
+	radio_set_param(RP_PANID(0x5678));
+	radio_set_state(STATE_RXAUTO);
 	sei();
-#if HIF_TYPE == HIF_AT90USB
-	/*
-	 * Wait for terminal user pressing a key so there is time to
-	 * attach a terminal emulator after the virtual serial port has
-	 * been established within the host OS.
-	 */
-	do {
-		inchar = hif_getc();
-	} while (EOF == inchar);
-#endif
 
 	/* Step 3: Going to receive frames */
-	state = TRX_IDLE;
-	rx_len = 0;
+	buf_n = 0;
 	while (1) {
-		/*while (state != TRX_IDLE)
-		  WAIT_MS(1);
-
-		if (rx_len > 0) {
-			//trx_reg_write(RG_TRX_STATE, CMD_TRX_OFF);
-			hif_printf(FLASH_STRING("zb"));
-			hif_putc(DATA_RECV_BLOCK);
-			for (i = 0; i < rx_len; i++)
-				hif_putc(rx_buf[i]);
-			rx_len = 0;
-			//trx_reg_write(RG_TRX_STATE, CMD_RX_AACK_ON);
-
+		/* Try to listen for incoming commands after sending data to the host */
+		for (; !rx_block && buf_n < RX_BUF_CNT; buf_n++) {
+			if (BUFFER_IS_LOCKED(pbuf[buf_n]) == true) {
+				hif_printf(FLASH_STRING("zb"));
+				hif_putc(DATA_RECV_BLOCK);
+				hif_putc(buffer_get_char(pbuf[buf_n]));
+				k = buffer_get_char(pbuf[buf_n]);
+				hif_putc(k);
+				for (j = 0; j < k; j++)
+					hif_putc(buffer_get_char(pbuf[buf_n]));
+				BUFFER_RESET(pbuf[buf_n], 0);
+				BUFFER_SET_UNLOCK(pbuf[buf_n]);
+				rx_block = 8;
+				break;
+			}
 		}
-		*/
-		if (getc_wait() == 'z' && getc_wait() == 'b') {
+		buf_n = buf_n % RX_BUF_CNT;
+
+		if (hif_getc() == 'z' && getc_wait() == 'b') {
+			/* read first byte non blocking */
 			switch (getc_wait()) {
 			case CMD_OPEN:
 				eeprom_read_block(buf, (void *)0x1F66, 8);
@@ -166,12 +149,11 @@ int main(void)
 				for (i = 0; i < len; i++)
 					buf[i] = getc_wait();
 				LED_SET(1);
-				state = TRX_TX;
-				trx_reg_write(RG_TRX_STATE, CMD_TX_ARET_ON);
-				trx_frame_write(len + 2, buf);
+				tx_pending = true;
+				radio_set_state(STATE_TXAUTO);
+				radio_send_frame(len + 2, buf, 1);
 				/* 2 bytes for automagically calculated crc */
-				TRX_SLPTR_HIGH();
-				TRX_SLPTR_LOW();
+				while (tx_pending);
 				break;
 			}
 			case CMD_ADDRESS:
@@ -212,50 +194,49 @@ int main(void)
 	}
 }
 
-ISR(TRX24_RX_END_vect)
+void usr_radio_tx_done(radio_tx_done_t status)
 {
-	uint8_t *pfrm, flen, lqi, i;
-	bool crc_ok;
+    LED_CLR(1);
 
-	LED_CLR(0);
-	pfrm = rxfrm;
-	flen = trx_frame_read_data_crc(pfrm, sizeof(rxfrm), &lqi, &crc_ok);
-
-	/* send data_recv_block */
-	
-	hif_printf(FLASH_STRING("zb"));
-	hif_putc(DATA_RECV_BLOCK);
-	hif_putc(lqi);
-	hif_putc(flen - 2);
-	
-	rx_buf[0] = lqi;
-	rx_buf[1] = flen - 2;
-
-	for (i = 0; i < flen - 2; i++)
-		hif_putc(pfrm[i]);
-	//rx_buf[i + 2] = pfrm[i];
-	rx_len = flen;
-	state = TRX_IDLE;
+    hif_printf(FLASH_STRING("zb"));
+    hif_putc(RESP_XMIT_BLOCK);
+    switch (status) {
+    case TX_OK:
+	    hif_putc(STATUS_SUCCESS);
+	    break;
+    default:
+	    hif_putc(STATUS_ERR);
+    }
+    tx_pending = false;
 }
 
-ISR(TRX24_RX_START_vect)
+uint8_t *usr_radio_receive_frame(uint8_t len, uint8_t *frm, uint8_t lqi,
+				 int8_t ed, uint8_t crc)
 {
+	static uint8_t i = 0;
+	uint8_t __sreg = SREG;
+
+	cli();
+
 	LED_SET(0);
-	state = TRX_RX;
+	for (; i < RX_BUF_CNT; i++) {
+		if (BUFFER_IS_LOCKED(pbuf[i]) == false && crc == 0) {
+			buffer_append_char(pbuf[i], lqi);
+			buffer_append_char(pbuf[i], len - 2);
+			buffer_append_block(pbuf[i], frm, len - 2);
+			BUFFER_SET_LOCK(pbuf[i]);
+			break;
+		}
+	}
+	i %= RX_BUF_CNT;
+
+	SREG = __sreg;
+	LED_CLR(0);
+	return frm;
 }
 
-ISR(TRX24_TX_END_vect)
+ISR(TIMER_IRQ_vect)
 {
-	static volatile trx_regval_t trac_status;
-
-	trac_status = trx_bit_read(SR_TRAC_STATUS);
-	trx_reg_write(RG_TRX_STATE, CMD_RX_AACK_ON);
-	LED_CLR(1);
-	PRINT_START_BYTES();//hif_printf(FLASH_STRING("zb"));
-	hif_putc(RESP_XMIT_BLOCK);
-	if (trac_status == TRAC_SUCCESS)
-		hif_putc(STATUS_SUCCESS);
-	else
-		hif_putc(STATUS_ERR);
-	state = TRX_IDLE;
+	if (rx_block > 0)
+		rx_block--;
 }

@@ -117,11 +117,13 @@ int main(void)
 				eeprom_read_block(buf, (void *)0x1F66, 8);
 				for (i = 0; i < 8; i++)
 					trx_reg_write(RG_IEEE_ADDR_7 + i, buf[i]);
+				radio_set_state(STATE_RXAUTO);
 				hif_printf(FLASH_STRING("zb"));
 				hif_putc(RESP_OPEN);
 				hif_putc(STATUS_SUCCESS);
 				break;
 			case CMD_CLOSE:
+				radio_set_state(STATE_SLEEP);
 				hif_printf(FLASH_STRING("zb"));
 				hif_putc(RESP_CLOSE);
 				hif_putc(STATUS_SUCCESS);
